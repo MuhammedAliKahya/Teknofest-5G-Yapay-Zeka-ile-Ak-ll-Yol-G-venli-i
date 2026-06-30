@@ -1,0 +1,378 @@
+import cv2
+from ultralytics import YOLO
+import easyocr
+import numpy as np
+import sys
+import os
+from collections import deque, Counter
+
+print("NİHAİ OTONOM SİSTEM: 'ADİL KAPIŞMA' & 'PİKSEL TABANLI SLALOM DEDEKTÖRÜ' AKTİF! 🚀")
+
+# ==========================================
+# TEST VİDEOSU VE ÇIKTI ADI GÜNCELLENDİ!
+# ==========================================
+TEST_EDILECEK_VIDEO = "togg_video3.mp4"
+CIKTI_VIDEO_ADI = "GPTtokatlayan98.avi"
+
+# Dosya varlığı kontrolü (Kritik hata önleyici)
+if not os.path.exists(TEST_EDILECEK_VIDEO):
+    print(f"\n HATA: '{TEST_EDILECEK_VIDEO}' dosyası dizinde bulunamadı!")
+    print("Mevcut dosyalar kontrol ediliyor...")
+    if os.path.exists("togg_video.mp4.mp4"):
+        print("BULUNDU: 'togg_video.mp4.mp4' dosyanız mevcut. Dosya adı otomatik olarak düzeltiliyor...")
+        os.rename("togg_video.mp4.mp4", "togg_video.mp4")
+    else:
+        print("Klasördeki video dosyalarından birini seçebilirsiniz:")
+        for f in os.listdir("."):
+            if f.endswith(".mp4"):
+                print(f" - {f}")
+        sys.exit(1)
+
+# ==========================================
+# 1. BEYİNLERİ YÜKLE (5 LOB - TAM KADRO)
+# ==========================================
+radar_beyni = YOLO("yolov8s.pt")
+plaka_beyni = YOLO("runs/detect/train/weights/best.pt")
+dms_beyni = YOLO("runs/detect/dms_beyni/weights/best.pt")
+telefon_beyni = YOLO("runs/detect/telefon_beyni/weights/best.pt")
+oyuncak_beyni = YOLO("runs/detect/oyuncak_beyni-2/weights/best.pt")
+
+okuyucu = easyocr.Reader(['tr', 'en'], gpu=True)
+
+# --- SINIF ADLARINI DİNAMİK OLARAK ANALİZ ETME (HATA ÖNLEYİCİ) ---
+# Telefon modelindeki telefon sınıfının indeksini buluyoruz
+telefon_sinif_indeksleri = []
+safe_sinif_indeksleri = []
+for cid, cname in telefon_beyni.names.items():
+    cname_lower = str(cname).lower()
+    if any(k in cname_lower for k in ["phone", "tel", "cell", "text", "call", "using", "hold", "konusma", "ahize", "mobile", "talking"]):
+        if not any(k in cname_lower for k in ["no", "safe", "not", "without", "normal"]):
+            telefon_sinif_indeksleri.append(cid)
+    if any(k in cname_lower for k in ["safe", "normal", "driving", "wheel", "steering", "background", "no_phone", "not_using"]):
+        safe_sinif_indeksleri.append(cid)
+
+if not telefon_sinif_indeksleri:
+    telefon_sinif_indeksleri = [0] # Fallback varsayılan indeks
+
+# DMS modelindeki sınıfları haritalandırıyoruz
+sigara_siniflari = []
+kemer_siniflari = []
+yorgunluk_siniflari = []
+for cid, cname in dms_beyni.names.items():
+    cname_lower = str(cname).lower()
+    if any(k in cname_lower for k in ["smoke", "cigar", "sigara", "smok"]):
+        sigara_siniflari.append(cid)
+    elif any(k in cname_lower for k in ["belt", "kemer", "buckle", "seatbelt"]):
+        kemer_siniflari.append(cid)
+    elif any(k in cname_lower for k in ["yawn", "sleep", "esneme", "drowsy", "tired", "fatigue", "yorgunluk"]):
+        yorgunluk_siniflari.append(cid)
+
+# Fallback varsayılan indeksler (Eğer etiketler düzgün yüklenmediyse)
+if not sigara_siniflari: sigara_siniflari = [0]
+if not kemer_siniflari: kemer_siniflari = [1]
+if not yorgunluk_siniflari: yorgunluk_siniflari = [2]
+
+# --- AYARLAR VE HAFIZALAR ---
+plaka_hafizasi = deque(maxlen=20)
+ESIK_DEGERI = 8
+guncel_plaka = "Araniyor..."
+
+IHLAL_ONAY_ESIGI = 3
+HIZ_TAMPON_BOYUTU = 5
+FRAME_GECIKMESI = 5
+GERCEK_ARAC_GENISLIGI_METRE = 1.8
+FOKAL_UZUNLUK = 1200
+slalom_alarm_sayaci = 0 # Slalom onay debounce süresi
+
+# Referans Koddan Alınan Hassas Slalom Ayarları
+ANALIZ_PENCERESI = 1.2   # Son 1.2 saniyelik hareket izi analiz edilir
+SAPMA_ORANI = 0.25       # Araç kendi genişliğinin %25'i kadar sağa/sola saparsa alarm tetiklenir
+YON_DEG_ESIGI = 2        # 2 net yön değişimi slalom (zigzag) sayılır
+
+# UNIFIED PRIMARY VEHICLE TRACKER HAFIZALARI (ID Değişimlerinden Etkilenmez)
+primary_konum_gecmisi = deque(maxlen=FRAME_GECIKMESI + 1)
+primary_hiz_hafizasi = deque(maxlen=HIZ_TAMPON_BOYUTU)
+primary_kutu_hafizasi = deque(maxlen=5)
+arac_yanal_gecmisi = {}  # Her araç ID'si için yanal piksel izi geçmişi
+
+ihlal_hafizasi = deque(maxlen=10)
+
+kamera = cv2.VideoCapture(TEST_EDILECEK_VIDEO)
+if not kamera.isOpened():
+    print(f" HATA: OpenCV '{TEST_EDILECEK_VIDEO}' dosyasını açamadı!")
+    sys.exit(1)
+
+fps = int(kamera.get(cv2.CAP_PROP_FPS)) if kamera.get(cv2.CAP_PROP_FPS) > 0 else 30
+genislik = int(kamera.get(cv2.CAP_PROP_FRAME_WIDTH))
+yukseklik = int(kamera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+kaydedici = cv2.VideoWriter(CIKTI_VIDEO_ADI, cv2.VideoWriter_fourcc(*'XVID'), fps, (genislik, yukseklik))
+
+frame_sayaci = 0
+
+while True:
+    ret, kare = kamera.read()
+    if not ret:
+        break
+
+    frame_sayaci += 1
+    anlik_arac_kutulari = []
+    aktif_uyari = None
+    uyari_rengi = (0, 255, 0)
+    anlik_en_iyi_tespit = None
+
+    # ==========================================
+    # A. RADAR, HIZ VE KUSURSUZ PİKSEL TABANLI SLALOM MOTORU
+    # ==========================================
+    radar_sonuclar = radar_beyni.track(kare, persist=True, verbose=False)
+
+    # Kadrajdaki en büyük aracı "Birincil Hedef" (Primary Vehicle) ve onun benzersiz ID'sini buluyoruz
+    primary_box = None
+    primary_track_id = None
+    max_area = 0
+    for sonuc in radar_sonuclar:
+        if sonuc.boxes.id is not None:
+            track_ids = sonuc.boxes.id.int().cpu().tolist()
+            for kutu, track_id in zip(sonuc.boxes, track_ids):
+                cls_id = int(kutu.cls[0])
+                if cls_id in [2, 5, 7]: # Araba, otobüs, kamyon
+                    x1, y1, x2, y2 = [int(x) for x in kutu.xyxy[0]]
+                    area = (x2 - x1) * (y2 - y1)
+                    if area > max_area:
+                        max_area = area
+                        primary_box = (x1, y1, x2, y2)
+                        primary_track_id = track_id
+
+    # Birincil araç algılandıysa hız, derinlik ve slalom analizi yapıyoruz
+    if primary_box and primary_track_id is not None:
+        px1, py1, px2, py2 = primary_box
+        anlik_arac_kutulari.append((px1, py1, px2, py2))
+
+        # 1. Genişlik Filtreleme ve Derinlik (Z) Hesabı
+        kutu_genisligi_px = px2 - px1
+        primary_kutu_hafizasi.append(kutu_genisligi_px)
+        stabil_genislik = sum(primary_kutu_hafizasi) / len(primary_kutu_hafizasi)
+        derinlik_z_metre = (GERCEK_ARAC_GENISLIGI_METRE * FOKAL_UZUNLUK) / stabil_genislik if stabil_genislik > 0 else 0
+
+        # 2. İleri-Geri Hız Hesabı
+        primary_konum_gecmisi.append((derinlik_z_metre, frame_sayaci))
+        gosterilen_hiz = 0
+
+        if len(primary_konum_gecmisi) >= 2:
+            eski_derinlik, eski_frame = primary_konum_gecmisi[0]
+            metre_mesafe = abs(derinlik_z_metre - eski_derinlik)
+            gecen_sure = (frame_sayaci - eski_frame) / fps
+
+            if gecen_sure > 0:
+                anlik_hiz_kmh = (metre_mesafe / gecen_sure) * 3.6
+                if 0.5 <= anlik_hiz_kmh <= 180:
+                    primary_hiz_hafizasi.append(anlik_hiz_kmh)
+                elif metre_mesafe < 0.02:
+                    primary_hiz_hafizasi.append(0)
+
+        if len(primary_hiz_hafizasi) > 0:
+            gosterilen_hiz = sum(primary_hiz_hafizasi) / len(primary_hiz_hafizasi)
+
+        # 3. Piksel Tabanlı Slalom Hesaplaması (Referans Kodunuzla Birebir Uyumlu)
+        arac_merkez_x = (px1 + px2) // 2
+        arac_genislik = px2 - px1
+
+        if primary_track_id not in arac_yanal_gecmisi:
+            arac_yanal_gecmisi[primary_track_id] = deque(maxlen=int(fps * ANALIZ_PENCERESI))
+        arac_yanal_gecmisi[primary_track_id].append(arac_merkez_x)
+
+        is_slalom = False
+        # Refleks hızı: Belirtilen analiz aralığının (en az %40'ı kadar) veri biriktiği an süzmeye başla
+        if len(arac_yanal_gecmisi[primary_track_id]) > (fps * 0.4):
+            liste = list(arac_yanal_gecmisi[primary_track_id])
+            mutlak_sapma = max(liste) - min(liste)
+
+            # PERSPEKTİF FİLTRESİ: Araç kameraya yaklaştıkça sapma oranını dinamik genişliğe bölüyoruz
+            oran = mutlak_sapma / arac_genislik
+
+            # Yön Değişimi Sayacı (Hatalı list[i] kısımları tamamen liste[i] olarak düzeltildi!)
+            yon_degisimi = 0
+            for i in range(1, len(liste) - 1):
+                if (liste[i] > liste[i-1] and liste[i] > liste[i+1]) or \
+                   (liste[i] < liste[i-1] and liste[i] < liste[i+1]):
+                    # Kamera titremelerini ve yol gürültülerini elemek için %4 genişlik barajı
+                    if abs(liste[i] - liste[i-1]) > (arac_genislik * 0.04):
+                        yon_degisimi += 1
+
+            # Referans şablon nihai karar mekanizması
+            if oran > SAPMA_ORANI or yon_degisimi >= YON_DEG_ESIGI:
+                is_slalom = True
+
+        # Slalom alarm onay ve latch kilidi (20 frame boyunca ekranda kalır)
+        if is_slalom:
+            slalom_alarm_sayaci = 20
+
+        if slalom_alarm_sayaci > 0:
+            slalom_alarm_sayaci -= 1
+            aktif_uyari = "TEHLIKELI SURUS: AGRESIP SLALOM SAPTANDI! ⚠️"
+            uyari_rengi = (0, 0, 255) # Kırmızı Alarm
+            cv2.rectangle(kare, (px1, py1), (px2, py2), (0, 0, 255), 3)
+            cv2.putText(kare, f"SLALOM TESPITI! - HIZ: {int(gosterilen_hiz)} km/h", (px1, py1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        else:
+            cv2.rectangle(kare, (px1, py1), (px2, py2), (255, 0, 0), 2)
+            cv2.putText(kare, f"HIZ: {int(gosterilen_hiz)} km/h", (px1, py1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 0, 0), 3)
+
+    # ==========================================
+    # B. 5. BEYİN: ARAÇ İÇİ NESNE (OYUNCAK/TEKNOCAN)
+    # ==========================================
+    oyuncak_sonuclar = oyuncak_beyni(kare, verbose=False)
+    for o_sonuc in oyuncak_sonuclar:
+        for o_kutu in o_sonuc.boxes:
+            if float(o_kutu.conf[0]) > 0.40:
+                ox1, oy1, ox2, oy2 = [int(x) for x in o_kutu.xyxy[0]]
+                cv2.rectangle(kare, (ox1, oy1), (ox2, oy2), (0, 255, 255), 2)
+                cv2.putText(kare, "ARAC ICI NESNE: OYUNCAK", (ox1, oy1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+    # ==========================================
+    # C. SÜRÜCÜ İZLEME VE ADİL KAPIŞMA (FAIR BATTLE)
+    # ==========================================
+    for sonuc in radar_sonuclar:
+        if sonuc.boxes.id is not None:
+            for kutu in sonuc.boxes:
+                if int(kutu.cls[0]) == 0 and float(kutu.conf[0]) > 0.40: # İnsan sınıfı
+                    hx1, hy1, hx2, hy2 = [int(x) for x in kutu.xyxy[0]]
+                    insan_cx = (hx1 + hx2) // 2
+                    insan_cy = (hy1 + hy2) // 2
+
+                    araba_icinde_mi = False
+                    dogru_koltukta_mi = False
+
+                    # Birincil araca göre insan konumu analizi
+                    if primary_box:
+                        ax1, ay1, ax2, ay2 = primary_box
+                        if ax1 < insan_cx < ax2 and ay1 < insan_cy < ay2:
+                            araba_icinde_mi = True
+                            if hx1 > (ax1 + (ax2 - ax1) // 3): # Sağ taraftaki koltuk (Kameraya göre şoför koltuğu analizi)
+                                dogru_koltukta_mi = True
+
+                    if araba_icinde_mi and dogru_koltukta_mi:
+                        cv2.rectangle(kare, (hx1, hy1), (hx2, hy2), (255, 255, 0), 1)
+                        cv2.putText(kare, "SURUCU", (hx1, hy1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+
+                        surucu_kirp = kare[max(0, hy1):hy2, max(0, hx1):hx2]
+                        if surucu_kirp.size > 0:
+                            cizilecek_kutu = None
+
+                            # --- UZMANLARIN SKORLARINI TOPLA ---
+                            tel_guven = 0
+                            tel_kutu = None
+                            t_son = telefon_beyni(surucu_kirp, verbose=False)
+                            for t in t_son:
+                                for tk in t.boxes:
+                                    conf = float(tk.conf[0])
+                                    cls_id = int(tk.cls[0])
+
+                                    # Güvenli sınıfları filtreleyip sadece telefonu doğrulamak için yüksek eşik kullanıyoruz (>0.70)
+                                    if cls_id not in safe_sinif_indeksleri and conf > 0.70:
+                                        if cls_id in telefon_sinif_indeksleri or len(telefon_beyni.names) <= 2:
+                                            tel_guven = conf
+                                            tel_kutu = [int(x) for x in tk.xyxy[0]]
+
+                            dms_guven = 0
+                            dms_kutu = None
+                            dms_etiket = ""
+                            d_son = dms_beyni(surucu_kirp, verbose=False)
+                            for d in d_son:
+                                for dk in d.boxes:
+                                    conf = float(dk.conf[0])
+                                    cls_id = int(dk.cls[0])
+
+                                    if conf > 0.58 and conf > dms_guven:
+                                        if cls_id in sigara_siniflari:
+                                            dms_guven = conf
+                                            dms_kutu = [int(x) for x in dk.xyxy[0]]
+                                            dms_etiket = "SIGARA"
+                                        elif cls_id in kemer_siniflari:
+                                            dms_guven = conf
+                                            dms_kutu = [int(x) for x in dk.xyxy[0]]
+                                            dms_etiket = "EMNIYET KEMERI IHLALI"
+                                        elif cls_id in yorgunluk_siniflari:
+                                            dms_guven = conf
+                                            dms_kutu = [int(x) for x in dk.xyxy[0]]
+                                            dms_etiket = "YORGUNLUK"
+
+                            # --- HAKEM KARARI: KİM DAHA EMİNSE O KAZANIR ---
+                            if tel_guven > 0 or dms_guven > 0:
+                                if tel_guven > dms_guven:
+                                    en_yuksek_guven = tel_guven
+                                    dx1, dy1, dx2, dy2 = tel_kutu
+                                    cizilecek_kutu = (hx1 + dx1, hy1 + dy1, hx1 + dx2, hy1 + dy2)
+                                    anlik_en_iyi_tespit = "TELEFON"
+                                else:
+                                    en_yuksek_guven = dms_guven
+                                    dx1, dy1, dx2, dy2 = dms_kutu
+                                    cizilecek_kutu = (hx1 + dx1, hy1 + dy1, hx1 + dx2, hy1 + dy2)
+                                    anlik_en_iyi_tespit = dms_etiket
+
+                            if anlik_en_iyi_tespit and cizilecek_kutu:
+                                g_x1, g_y1, g_x2, g_y2 = cizilecek_kutu
+                                cv2.rectangle(kare, (g_x1, g_y1), (g_x2, g_y2), (0, 255, 255), 1)
+                                cv2.putText(kare, f"{anlik_en_iyi_tespit} (%{int(en_yuksek_guven*100)})", (g_x1, g_y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
+                    elif araba_icinde_mi and not dogru_koltukta_mi:
+                        cv2.rectangle(kare, (hx1, hy1), (hx2, hy2), (128, 128, 128), 1)
+                        cv2.putText(kare, "YOLCU", (hx1, hy1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (128, 128, 128), 1)
+
+    # ==========================================
+    # C.2 ZAMAN FİLTRESİ (DEBOUNCER)
+    # ==========================================
+    ihlal_hafizasi.append(anlik_en_iyi_tespit)
+    oylar = Counter([x for x in ihlal_hafizasi if x is not None])
+    if len(oylar) > 0 and aktif_uyari is None: # Slalom uyarısı yoksa DMS ihlal uyarısı basılır
+        tespit, sayi = oylar.most_common(1)[0]
+        if sayi >= IHLAL_ONAY_ESIGI:
+            if "TELEFON" in tespit:
+                aktif_uyari, uyari_rengi = "KURAL IHLALI: TELEFONLA KONUSMA!", (0, 0, 255)
+            elif any(w in tespit.lower() for w in ["yawn", "sleep", "closed", "drowsy", "fatigue", "yorgunluk"]):
+                aktif_uyari, uyari_rengi = "UYARI: SURUCU YORGUNLUGU!", (0, 165, 255)
+            elif any(w in tespit.lower() for w in ["belt", "unbuckled", "no_seatbelt", "kemer"]):
+                aktif_uyari, uyari_rengi = "IHLAL: KEMERSIZ SURUS!", (0, 0, 255)
+            elif any(w in tespit.lower() for w in ["cigar", "smok", "sigara"]):
+                aktif_uyari, uyari_rengi = "KURAL IHLALI: SIGARA!", (0, 0, 255)
+            else:
+                aktif_uyari, uyari_rengi = f"TESPIT: {tespit}", (0, 255, 255)
+
+    # ==========================================
+    # D. PLAKA OKUMA BEYNİ
+    # ==========================================
+    plaka_sonuclar = plaka_beyni(kare, verbose=False)
+    for sonuc in plaka_sonuclar:
+        for kutu in sonuc.boxes:
+            if float(kutu.conf[0]) > 0.50:
+                px1, py1, px2, py2 = [int(x) for x in kutu.xyxy[0]]
+                cv2.rectangle(kare, (px1, py1), (px2, py2), (0, 0, 255), 3)
+                try:
+                    plaka_resmi = kare[max(0, py1):py2, max(0, px1):px2]
+                    buyuk = cv2.resize(plaka_resmi, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+                    gri = cv2.cvtColor(buyuk, cv2.COLOR_BGR2GRAY)
+                    _, sb = cv2.threshold(gri, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+                    okuma = okuyucu.readtext(sb, detail=0, allowlist='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ')
+                    if len(okuma) > 0:
+                        ham = "".join(okuma).replace(" ", "")
+                        if len(ham) >= 6:
+                            plaka_hafizasi.append(ham)
+                except:
+                    pass
+
+    if len(plaka_hafizasi) > 0:
+        oylar = Counter(plaka_hafizasi)
+        en_populer, oy = oylar.most_common(1)[0]
+        if oy >= ESIK_DEGERI:
+            guncel_plaka = en_populer
+
+    cv2.putText(kare, f"ARAC PLAKASI: {guncel_plaka}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+
+    if aktif_uyari:
+        text_size = cv2.getTextSize(aktif_uyari, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)[0]
+        text_x = (genislik - text_size[0]) // 2
+        cv2.putText(kare, aktif_uyari, (text_x, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.2, uyari_rengi, 3)
+
+    kaydedici.write(kare)
+
+kamera.release()
+kaydedici.release()
+print(f"\nOperasyon Başarılı! Yeni test videosu için {CIKTI_VIDEO_ADI} kaydedildi.")
